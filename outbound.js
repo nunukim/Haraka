@@ -35,6 +35,14 @@ var uniq = Math.round(Math.random() * MAX_UNIQ);
 var max_concurrency = config.get('outbound.concurrency_max') || 100;
 var queue_count = 0;
 
+var Queue = require('./plugins/outbound_control/queue').Queue;
+var processing_queue = new Queue();
+var get_ISPConfig = require('./plugins/outbound_control/rate_policy').get_ISPConfig;
+var get_policy = require('./plugins/outbound_control/rate_policy').get_policy;
+var deliver_client = require('./plugins/outbound_control/send_client');
+var delivery_concurrency = require('./plugins/outbound_control/rate_policy').delivery_concurrency;
+var conn_pool = require('./plugins/outbound_control/rate_policy').conn_pool;
+
 exports.list_queue = function () {
     this._load_cur_queue("_list_file");
 }
@@ -210,7 +218,7 @@ exports.send_trans_email = function (transaction, next) {
 exports.process_domain = function (ok_paths, todo, hmails, cb) {
     var plugin = this;
     this.loginfo("Processing domain: " + todo.domain);
-    var fname = _fname();
+    var fname = _fname() + '@' + todo.domain;
     var tmp_path = path.join(queue_dir, '.' + fname);
     var ws = fs.createWriteStream(tmp_path, { flags: WRITE_EXCL });
     ws.on('close', function () {
@@ -328,19 +336,11 @@ exports._load_cur_queue = function (cb_name) {
 
 exports.load_queue_files = function (cb_name, files) {
     var plugin = this;
-    if (files.length === 0) return;
-
+    if (files.length === 0)
+        return plugin.heart_beat();
     this.loginfo("Loading some of the queue...");
-
-    if ((delivery_concurrency >= max_concurrency)
-        || config.get('outbound.disabled'))
-    {
-        // try again in 1 second if delivery is disabled
-        setTimeout(function () {plugin.load_queue_files(cb_name, files)}, 1000);
-        return;
-    }
-
-    for (var i=1; i <= max_concurrency; i++) {
+    // try to send every email; failed sendings will be push into the queue
+    for (var i=1; i <= files.length; i++) {
         if (files.length === 0) break;
         var file = files.shift();
         if (/^\./.test(file)) {
@@ -349,16 +349,26 @@ exports.load_queue_files = function (cb_name, files) {
         }
         var hmail = new HMailItem(file, path.join(queue_dir, file));
         this[cb_name](hmail);
+    }
 
         if ((files.length === 0) || (i === max_concurrency)) {
             // end of loop or end of files
             var self = this;
             hmail.once('ready', function () {self.load_queue_files(cb_name, files)});
             break;
-        }
+        
+	var keys =  Object.keys(processing_queue.mails);
+	var index = i % keys.length;
+        var mail = processing_queue.shift(index, keys);
+        mail.send();
     }
-}
 
+    var interval = processing_queue.size() > 20 ? 3000 : 1000;
+    var plugin = this;
+    setTimeout(function() {
+        plugin.heart_beat();
+    }, interval);
+}
 exports._add_file = function (hmail) {
     var self = this;
     this.loginfo("Adding file: " + hmail.filename);
@@ -398,7 +408,7 @@ function TODOItem (domain, recipients, transaction) {
 /////////////////////////////////////////////////////////////////////////////
 // HMailItem - encapsulates an individual outbound mail item
 
-function HMailItem (filename, path, notes) {
+function HMailItem (filename, path, todo) {
     events.EventEmitter.call(this);
     var matches = filename.match(fn_re);
     if (!matches) {
@@ -495,10 +505,39 @@ HMailItem.prototype.send = function () {
         var self = this;
         this.once('ready', function () { self._send() });
     }
-    else {
-        this._send();
+    // push this email back to the queue
+    else
+    {
+        processing_queue.push(this);
     }
 }
+
+HMailItem.prototype.process_bad_code = function(code, msg) {
+    var self = this;
+    self.clear_timers();
+
+    // if this email is delivered successfully; not neccessary
+    // to goto next steps
+    if (self.sent) return;
+
+    // in case the server side respond two error messages to
+    // a single command
+    if (!self.erred)  {
+	self.erred = true;
+	self.bounce(msg);	
+    }
+}
+
+HMailItem.prototype.try_again = function(status) {
+    var self = this;
+    get_policy(this.dom).dispose();
+    self.loginfo(self.filename + ': not send....'  + status);    
+    if (status === constants.no)
+        processing_queue.push(this);
+    else if (status === constants.error)
+        self.temp_fail('connection closed before sent out all data');
+}
+
 
 HMailItem.prototype._send = function () {
     if ((delivery_concurrency >= max_concurrency)
@@ -510,7 +549,7 @@ HMailItem.prototype._send = function () {
         setTimeout(function () {hmail._send()}, 1000);
         return;
     }
-
+    
     plugins.run_hooks('send_email', this);
 
 }
@@ -535,30 +574,30 @@ HMailItem.prototype.get_mx = function () {
 
 HMailItem.prototype.get_mx_respond = function (retval, mx) {
     switch(retval) {
-        case constants.ok:
-                var mx_list;
-                if (Array.isArray(mx)) {
-                    mx_list = mx;
-                }
-                else if (typeof mx === "object") {
-                    mx_list = [mx];
-                }
-                else {
-                    // assume string
-                    var matches = /^(.*?)(:(\d+))?$/.exec(mx);
-                    if (!matches) {
-                        throw("get_mx returned something that doesn't match hostname or hostname:port");
-                    }
-                    mx_list = [{priority: 0, exchange: matches[1], port: matches[3]}];
-                }
-                this.logdebug("Got an MX from Plugin: " + this.todo.domain + " => 0 " + mx);
-                return this.found_mx(null, mx_list);
-        case constants.deny:
-                this.logwarn("get_mx plugin returned DENY: " + mx);
-                return this.bounce("No MX for " + this.domain);
-        case constants.denysoft:
-                this.logwarn("get_mx plugin returned DENYSOFT: " + mx);
-                return this.temp_fail("Temporary MX lookup error for " + this.domain);
+    case constants.ok:
+        var mx_list;
+        if (Array.isArray(mx)) {
+            mx_list = mx;
+        }
+        else if (typeof mx === "object") {
+            mx_list = [mx];
+        }
+        else {
+            // assume string
+            var matches = /^(.*?)(:(\d+))?$/.exec(mx);
+            if (!matches) {
+                throw("get_mx returned something that doesn't match hostname or hostname:port");
+            }
+            mx_list = [{priority: 0, exchange: matches[1], port: matches[3]}];
+        }
+        this.logdebug("Got an MX from Plugin: " + this.todo.domain + " => 0 " + mx);
+        return this.found_mx(null, mx_list);
+    case constants.deny:
+        this.logwarn("get_mx plugin returned DENY: " + mx);
+        return this.bounce("No MX for " + this.domain);
+    case constants.denysoft:
+        this.logwarn("get_mx plugin returned DENYSOFT: " + mx);
+        return this.temp_fail("Temporary MX lookup error for " + this.domain);
     }
 
     // if none of the above return codes, drop through to this...
@@ -687,7 +726,7 @@ HMailItem.prototype.try_deliver = function () {
     }
 
     this.loginfo("Looking up A records for: " + host);
- 
+    
     // now we have a host, we have to lookup the addresses for that host
     // and try each one in order they appear
     dns.resolve(host, function (err, addresses) {
@@ -711,7 +750,6 @@ var smtp_regexp = /^([0-9]{3})([ -])(.*)/;
 
 HMailItem.prototype.try_deliver_host = function (mx) {
     if (this.hostlist.length === 0) {
-        delivery_concurrency--;
         return this.try_deliver(); // try next MX
     }
     
@@ -1016,9 +1054,29 @@ HMailItem.prototype.bounce_respond = function (retval, msg) {
     });
 }
 
+
+HMailItem.prototype.process_bad_code = function(code, msg) {
+    var self = this;
+    
+    // if this email is delivered successfully; not neccessary
+    // to goto next steps
+    if (self.sent) return;
+
+    // in case the server side respond two error messages to
+    // a single command
+    if (!self.erred)  {
+	self.erred = true;
+	self.bounce(msg);	
+    }
+}
+
+
 HMailItem.prototype.double_bounce = function (err) {
     this.logerror("Double bounce: " + err);
-    fs.unlink(this.path);
+    fs.unlink(this.path, function() {
+        hmail.loginfo(this.filename + ' deleted');
+    });
+    this.send_next();
     // TODO: fill this in... ?
     // One strategy is perhaps log to an mbox file. What do other servers do?
     // Another strategy might be delivery "plugins" to cope with this.
@@ -1070,15 +1128,25 @@ HMailItem.prototype.temp_fail = function (err) {
         
         hmail.path = path.join(queue_dir, new_filename);
         hmail.filename = new_filename;
-
+        
         setTimeout(function () {hmail.send()}, delay);
     });
 }
 
 // The following handler has an impact on outgoing mail. It does remove the queue file.
 HMailItem.prototype.delivered_respond = function (retval, msg) {
+    var self = this;
     if (retval != constants.cont && retval != constants.ok) {
         this.logwarn("delivered plugin responded with: " + retval + " msg=" + msg + ".");
     }
     this.discard();
 };
+
+HMailItem.prototype.send_next = function() {
+    var hmail = processing_queue.dequeue(this);    
+    if (hmail)
+    {
+        get_policy(this.dom).prepose();
+        setTimeout(function(){hmail.send()}, 0);        
+    }
+}
